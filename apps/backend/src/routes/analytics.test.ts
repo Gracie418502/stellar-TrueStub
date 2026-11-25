@@ -321,4 +321,50 @@ describe('GET /api/analytics (mounted route)', () => {
       expect(res.body.error).toBe('Failed to load platform analytics');
     });
   });
+
+  // ── Issue #629: mixed-case status values must not fall through ────────────
+  describe('mixed-case active status normalization (#629)', () => {
+    it('counts an escrow with status "Pending" (title-case) as active', async () => {
+      // The DB query now uses _ilike so any casing is matched server-side.
+      // This test verifies the route counts the row that the DB returns.
+      const periodRows: never[] = [];
+      const activeRows = [
+        { amount: '100', currency: 'USD', status: 'Pending', created_at: '2026-01-01T00:00:00Z', released_at: null },
+      ];
+
+      requestMock
+        .mockResolvedValueOnce({ escrow_transactions: periodRows })
+        .mockResolvedValueOnce({ escrow_transactions: activeRows });
+
+      const res = await request(app).get('/api/analytics').query({
+        start: '2026-01-01T00:00:00.000Z',
+        end: '2026-01-01T23:59:59.999Z',
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.platformHealth.activeEscrows).toBe(1);
+      expect(res.body.platformHealth.totalValueLocked).toBe(100);
+    });
+
+    it('counts escrows with uppercase status "ACTIVE" as active', async () => {
+      const periodRows: never[] = [];
+      const activeRows = [
+        { amount: '50', currency: 'USDC', status: 'ACTIVE', created_at: '2026-01-01T00:00:00Z', released_at: null },
+        { amount: '75', currency: 'USD', status: 'DISPUTED', created_at: '2026-01-01T00:00:00Z', released_at: null },
+      ];
+
+      requestMock
+        .mockResolvedValueOnce({ escrow_transactions: periodRows })
+        .mockResolvedValueOnce({ escrow_transactions: activeRows });
+
+      const res = await request(app).get('/api/analytics').query({
+        start: '2026-01-01T00:00:00.000Z',
+        end: '2026-01-01T23:59:59.999Z',
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.platformHealth.activeEscrows).toBe(2);
+      expect(res.body.platformHealth.totalValueLocked).toBe(125);
+    });
+  });
 });
