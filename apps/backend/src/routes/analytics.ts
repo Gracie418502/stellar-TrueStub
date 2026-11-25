@@ -32,10 +32,7 @@ interface AssetBreakdownEntry {
 }
 
 const PAGE_SIZE = 500;
-const ACTIVE_STATUSES = [
-  "pending", "funded", "active", "disputed",
-  "PENDING", "FUNDED", "ACTIVE", "DISPUTED",
-];
+const ACTIVE_STATUSES = new Set(["pending", "funded", "active", "disputed"]);
 const COMPLETED_STATUSES = new Set(["completed", "released", "resolved"]);
 const DOLLAR_DENOMINATED_CURRENCIES = new Set(["USD", "USDC"]);
 const UNKNOWN_CURRENCY = "UNKNOWN";
@@ -133,7 +130,7 @@ analyticsRouter.get("/", async (req, res) => {
   try {
     const [periodRows, activeRows] = await Promise.all([
       fetchEscrows({ created_at: { _gte: start.toISOString(), _lte: end.toISOString() } }),
-      fetchEscrows({ status: { _in: ACTIVE_STATUSES } }),
+      fetchEscrows({ status: { _iregex: `^(${[...ACTIVE_STATUSES].join("|")})$` } }),
     ]);
 
     const buckets = new Map<string, EscrowAnalyticsDay>();
