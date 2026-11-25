@@ -538,3 +538,45 @@ describe("DisputeService — concurrent transitions (#540)", () => {
     expect(b.state).toBe("WITHDRAWN");
   });
 });
+
+// ── Persistence across restarts (#511) ────────────────────────────────────
+// The acceptance criterion: creating a dispute, recreating the service
+// (simulating a restart), and confirming the dispute is still readable.
+//
+// In production, DisputeService uses PostgresDisputeStore so the data lives
+// in Postgres and survives a process restart. This test verifies the
+// DisputeStore interface contract: a new DisputeService constructed with
+// the same backing store can read disputes written by the previous instance.
+describe("DisputeService — persistence across restarts (#511)", () => {
+  it("dispute opened before a restart is readable by the new instance", async () => {
+    // Shared store simulates durable storage (Postgres in production).
+    const sharedStore = new TestDisputeStore();
+
+    // First instance: open a dispute.
+    const instance1 = new DisputeService(sharedStore);
+    await instance1.openDispute({ ...base, disputeId: "restart-test-dispute" });
+
+    // "Restart": construct a fresh DisputeService backed by the same store.
+    const instance2 = new DisputeService(sharedStore);
+    const found = await instance2.getDispute("restart-test-dispute");
+
+    expect(found).toBeDefined();
+    expect(found!.disputeId).toBe("restart-test-dispute");
+    expect(found!.state).toBe("OPEN");
+  });
+
+  it("transitions made before a restart are visible to the new instance", async () => {
+    const sharedStore = new TestDisputeStore();
+
+    const instance1 = new DisputeService(sharedStore);
+    await instance1.openDispute({ ...base, disputeId: "restart-transition-test" });
+    await instance1.transition("restart-transition-test", "escalate");
+
+    const instance2 = new DisputeService(sharedStore);
+    const found = await instance2.getDispute("restart-transition-test");
+
+    expect(found).toBeDefined();
+    expect(found!.state).toBe("ESCALATED");
+    expect(found!.escalatedAt).toBeTruthy();
+  });
+});
