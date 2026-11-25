@@ -232,6 +232,76 @@ export class InMemoryRefundStore implements RefundStore {
   }
 }
 
+// ── Postgres-backed store (#512) ───────────────────────────────────────────
+
+/**
+ * Maps a `refund_claims` DB row (snake_case) to the domain `ClaimedRefund`
+ * shape (camelCase).
+ */
+function rowToClaimedRefund(row: Record<string, unknown>): ClaimedRefund {
+  return {
+    refundId: row["refund_id"] as string,
+    escrowId: row["escrow_id"] as string,
+    claimedAt: row["claimed_at"] as string,
+    amount: (row["amount"] as string | undefined) ?? undefined,
+    currency: (row["currency"] as string | undefined) ?? undefined,
+    claimedBy: (row["claimed_by"] as string | undefined) ?? undefined,
+    status: (row["status"] as RefundStatus | undefined) ?? undefined,
+    refundTo: (row["refund_to"] as string | undefined) ?? undefined,
+    escrowType: (row["escrow_type"] as EscrowType | undefined) ?? undefined,
+    milestoneIndex: (row["milestone_index"] as string | undefined) ?? undefined,
+    txHash: (row["tx_hash"] as string | undefined) ?? undefined,
+    failureReason: (row["failure_reason"] as string | undefined) ?? undefined,
+  };
+}
+
+function claimedRefundToRow(claim: ClaimedRefund): Record<string, unknown> {
+  return {
+    refund_id: claim.refundId,
+    escrow_id: claim.escrowId,
+    claimed_at: claim.claimedAt,
+    amount: claim.amount ?? null,
+    currency: claim.currency ?? null,
+    claimed_by: claim.claimedBy ?? null,
+    status: claim.status ?? "claimed",
+    refund_to: claim.refundTo ?? null,
+    escrow_type: claim.escrowType ?? null,
+    milestone_index: claim.milestoneIndex ?? null,
+    tx_hash: claim.txHash ?? null,
+    failure_reason: claim.failureReason ?? null,
+  };
+}
+
+/**
+ * Postgres-backed refund idempotency store. Every read and write goes through
+ * `HasuraService` → Postgres, so refund claims survive a restart and are
+ * shared by every backend instance. The PRIMARY KEY on `refund_claims.refund_id`
+ * is the authoritative cross-instance duplicate guard (#512).
+ */
+export class PostgresRefundStore implements RefundStore {
+  async has(refundId: string): Promise<boolean> {
+    const row = await HasuraService.getRefundClaim(refundId);
+    return row !== null;
+  }
+
+  async get(refundId: string): Promise<ClaimedRefund | undefined> {
+    const row = await HasuraService.getRefundClaim(refundId);
+    return row ? rowToClaimedRefund(row) : undefined;
+  }
+
+  async set(_refundId: string, record: ClaimedRefund): Promise<void> {
+    await HasuraService.upsertRefundClaim(claimedRefundToRow(record));
+  }
+
+  async insertIfAbsent(refundId: string, record: ClaimedRefund): Promise<boolean> {
+    return HasuraService.insertRefundClaimIfAbsent(claimedRefundToRow(record));
+  }
+
+  async cleanupBefore(cutoff: Date): Promise<number> {
+    return HasuraService.deleteRefundClaimsBefore(cutoff.toISOString());
+  }
+}
+
 // ── Error codes ────────────────────────────────────────────────────────────
 
 export const REFUND_ERROR_CODES = {
@@ -425,8 +495,11 @@ export class RefundService {
 }
 
 // Singleton — routes import this shared instance.  Claims execute on-chain.
+// PostgresRefundStore backs the idempotency check with the `refund_claims`
+// Postgres table so claims survive a restart and are consistent across every
+// backend instance (#512).
 export const refundService = new RefundService(
-  new InMemoryRefundStore(),
+  new PostgresRefundStore(),
   new TrustlessWorkRefundExecutor(),
   (escrowId) => HasuraService.getEscrowAmountByContractId(escrowId),
 );

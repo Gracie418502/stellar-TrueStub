@@ -228,3 +228,48 @@ describe("RefundService — idempotency guard (#153)", () => {
     });
   });
 });
+
+// ── Persistence across restarts (#512) ────────────────────────────────────
+//
+// Proves that RefundService does not double-pay when the process restarts:
+// a claim recorded by one instance must be visible to a fresh instance backed
+// by the same durable store, so the second instance rejects a duplicate claim
+// rather than re-executing the refund.
+describe("RefundService — persistence across restarts (#512)", () => {
+  it("claim recorded by one instance is rejected as a duplicate by a new instance", async () => {
+    // A shared store represents durable storage (Postgres in production).
+    const sharedStore = new InMemoryRefundStore();
+
+    // First instance claims the refund.
+    const firstInstance = new RefundService(sharedStore);
+    const claimed = await firstInstance.claimRefund(basePayload);
+    expect(claimed.refundId).toBe(basePayload.refundId);
+    expect(claimed.status).toBe("claimed");
+
+    // Simulate a restart: construct a brand-new RefundService backed by the
+    // same durable store. In production this is PostgresRefundStore.
+    const restartedInstance = new RefundService(sharedStore);
+
+    // The restarted instance must reject a duplicate claim with ALREADY_CLAIMED,
+    // not re-execute the refund.
+    await expect(restartedInstance.claimRefund(basePayload)).rejects.toMatchObject({
+      statusCode: 409,
+      code: REFUND_ERROR_CODES.ALREADY_CLAIMED,
+    });
+  });
+
+  it("claim status is readable by a new instance after restart", async () => {
+    const sharedStore = new InMemoryRefundStore();
+
+    const firstInstance = new RefundService(sharedStore);
+    await firstInstance.claimRefund(basePayload);
+
+    // New instance after restart.
+    const restartedInstance = new RefundService(sharedStore);
+    const status = await restartedInstance.getClaimStatus(basePayload.refundId);
+
+    expect(status).toBeDefined();
+    expect(status!.refundId).toBe(basePayload.refundId);
+    expect(status!.escrowId).toBe(basePayload.escrowId);
+  });
+});

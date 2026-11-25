@@ -624,6 +624,175 @@ export class HasuraService {
     return data.delete_processed_webhook_events?.affected_rows ?? 0;
   }
 
+  // ── Refund claims (#512) ─────────────────────────────────────────────────
+
+  /**
+   * Fetches a single refund claim by its refundId.
+   * Returns null when no row exists.
+   */
+  static async getRefundClaim(refundId: string): Promise<Record<string, unknown> | null> {
+    const query = `
+      query GetRefundClaim($refundId: String!) {
+        refund_claims_by_pk(refund_id: $refundId) {
+          refund_id
+          escrow_id
+          claimed_at
+          amount
+          currency
+          claimed_by
+          status
+          refund_to
+          escrow_type
+          milestone_index
+          tx_hash
+          failure_reason
+        }
+      }
+    `;
+    const data = await hasuraClient.request<{ refund_claims_by_pk?: Record<string, unknown> | null }>(
+      query,
+      { refundId }
+    );
+    return data.refund_claims_by_pk ?? null;
+  }
+
+  /**
+   * Upserts a refund claim row (insert or update all columns on conflict).
+   */
+  static async upsertRefundClaim(claim: Record<string, unknown>): Promise<void> {
+    const mutation = `
+      mutation UpsertRefundClaim(
+        $refundId: String!
+        $escrowId: String!
+        $claimedAt: timestamptz!
+        $amount: String
+        $currency: String
+        $claimedBy: String
+        $status: String!
+        $refundTo: String
+        $escrowType: String
+        $milestoneIndex: String
+        $txHash: String
+        $failureReason: String
+      ) {
+        insert_refund_claims_one(
+          object: {
+            refund_id: $refundId
+            escrow_id: $escrowId
+            claimed_at: $claimedAt
+            amount: $amount
+            currency: $currency
+            claimed_by: $claimedBy
+            status: $status
+            refund_to: $refundTo
+            escrow_type: $escrowType
+            milestone_index: $milestoneIndex
+            tx_hash: $txHash
+            failure_reason: $failureReason
+          }
+          on_conflict: {
+            constraint: refund_claims_pkey
+            update_columns: [
+              escrow_id, claimed_at, amount, currency, claimed_by,
+              status, refund_to, escrow_type, milestone_index,
+              tx_hash, failure_reason
+            ]
+          }
+        ) {
+          refund_id
+        }
+      }
+    `;
+    await hasuraClient.request(mutation, {
+      refundId: claim["refund_id"],
+      escrowId: claim["escrow_id"],
+      claimedAt: claim["claimed_at"],
+      amount: claim["amount"] ?? null,
+      currency: claim["currency"] ?? null,
+      claimedBy: claim["claimed_by"] ?? null,
+      status: claim["status"],
+      refundTo: claim["refund_to"] ?? null,
+      escrowType: claim["escrow_type"] ?? null,
+      milestoneIndex: claim["milestone_index"] ?? null,
+      txHash: claim["tx_hash"] ?? null,
+      failureReason: claim["failure_reason"] ?? null,
+    });
+  }
+
+  /**
+   * Atomically inserts a refund claim. Returns true when the row was
+   * inserted (this caller won) and false when the refundId already exists.
+   */
+  static async insertRefundClaimIfAbsent(claim: Record<string, unknown>): Promise<boolean> {
+    const mutation = `
+      mutation InsertRefundClaimIfAbsent(
+        $refundId: String!
+        $escrowId: String!
+        $claimedAt: timestamptz!
+        $amount: String
+        $currency: String
+        $claimedBy: String
+        $status: String!
+        $refundTo: String
+        $escrowType: String
+        $milestoneIndex: String
+      ) {
+        insert_refund_claims(
+          objects: [{
+            refund_id: $refundId
+            escrow_id: $escrowId
+            claimed_at: $claimedAt
+            amount: $amount
+            currency: $currency
+            claimed_by: $claimedBy
+            status: $status
+            refund_to: $refundTo
+            escrow_type: $escrowType
+            milestone_index: $milestoneIndex
+          }]
+          on_conflict: { constraint: refund_claims_pkey, update_columns: [] }
+        ) {
+          affected_rows
+        }
+      }
+    `;
+    const data = await hasuraClient.request<{ insert_refund_claims?: { affected_rows?: number } }>(
+      mutation,
+      {
+        refundId: claim["refund_id"],
+        escrowId: claim["escrow_id"],
+        claimedAt: claim["claimed_at"],
+        amount: claim["amount"] ?? null,
+        currency: claim["currency"] ?? null,
+        claimedBy: claim["claimed_by"] ?? null,
+        status: claim["status"],
+        refundTo: claim["refund_to"] ?? null,
+        escrowType: claim["escrow_type"] ?? null,
+        milestoneIndex: claim["milestone_index"] ?? null,
+      }
+    );
+    return (data.insert_refund_claims?.affected_rows ?? 0) > 0;
+  }
+
+  /**
+   * Deletes refund claims whose claimed_at is before `cutoff`.
+   * Returns the count of deleted rows.
+   */
+  static async deleteRefundClaimsBefore(cutoff: string): Promise<number> {
+    const mutation = `
+      mutation DeleteRefundClaimsBefore($cutoff: timestamptz!) {
+        delete_refund_claims(where: { claimed_at: { _lt: $cutoff } }) {
+          affected_rows
+        }
+      }
+    `;
+    const data = await hasuraClient.request<{ delete_refund_claims?: { affected_rows?: number } }>(
+      mutation,
+      { cutoff }
+    );
+    return data.delete_refund_claims?.affected_rows ?? 0;
+  }
+
   /**
    * Delete only the caller's ticket listing. PostgreSQL's BEFORE DELETE trigger
    * is the authoritative guard, so direct Hasura mutations and concurrent
