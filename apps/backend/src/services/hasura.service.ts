@@ -655,4 +655,210 @@ export class HasuraService {
       throw new Error("Failed to delete listing from Hasura");
     }
   }
+
+  // ── Refund persistence (#512) ─────────────────────────────────────────────
+  /**
+   * Atomically inserts a refund record, relying on the PRIMARY KEY constraint
+   * on `refund_id` to reject duplicates.  Returns `true` when the insert
+   * succeeded (this caller won the race) and `false` when a row for
+   * `refund_id` already existed.
+   */
+  static async insertRefundIfAbsent(row: RefundRow): Promise<boolean> {
+    const mutation = `
+      mutation InsertRefundIfAbsent(
+        $refundId: String!
+        $escrowId: String!
+        $claimedAt: timestamptz!
+        $amount: String
+        $currency: String
+        $claimedBy: String
+        $status: String!
+        $refundTo: String
+        $escrowType: String
+        $milestoneIndex: String
+        $txHash: String
+        $failureReason: String
+      ) {
+        insert_refunds(
+          objects: [{
+            refund_id: $refundId
+            escrow_id: $escrowId
+            claimed_at: $claimedAt
+            amount: $amount
+            currency: $currency
+            claimed_by: $claimedBy
+            status: $status
+            refund_to: $refundTo
+            escrow_type: $escrowType
+            milestone_index: $milestoneIndex
+            tx_hash: $txHash
+            failure_reason: $failureReason
+          }]
+          on_conflict: { constraint: refunds_pkey, update_columns: [] }
+        ) {
+          affected_rows
+        }
+      }
+    `;
+    const data = await hasuraClient.request<{ insert_refunds?: { affected_rows?: number } }>(
+      mutation,
+      {
+        refundId: row.refund_id,
+        escrowId: row.escrow_id,
+        claimedAt: row.claimed_at,
+        amount: row.amount ?? null,
+        currency: row.currency ?? null,
+        claimedBy: row.claimed_by ?? null,
+        status: row.status,
+        refundTo: row.refund_to ?? null,
+        escrowType: row.escrow_type ?? null,
+        milestoneIndex: row.milestone_index ?? null,
+        txHash: row.tx_hash ?? null,
+        failureReason: row.failure_reason ?? null,
+      }
+    );
+    return (data.insert_refunds?.affected_rows ?? 0) > 0;
+  }
+
+  /**
+   * Fetches a single refund record by its idempotency key.
+   * Returns `null` when no row exists.
+   */
+  static async getRefund(refundId: string): Promise<RefundRow | null> {
+    const query = `
+      query GetRefund($refundId: String!) {
+        refunds(where: { refund_id: { _eq: $refundId } }, limit: 1) {
+          refund_id
+          escrow_id
+          claimed_at
+          amount
+          currency
+          claimed_by
+          status
+          refund_to
+          escrow_type
+          milestone_index
+          tx_hash
+          failure_reason
+          retry_count
+        }
+      }
+    `;
+    const data = await hasuraClient.request<{ refunds?: RefundRow[] }>(query, { refundId });
+    return data.refunds?.[0] ?? null;
+  }
+
+  /**
+   * Checks whether a refund record exists for `refundId`.
+   */
+  static async hasRefund(refundId: string): Promise<boolean> {
+    const query = `
+      query HasRefund($refundId: String!) {
+        refunds_aggregate(where: { refund_id: { _eq: $refundId } }) {
+          aggregate { count }
+        }
+      }
+    `;
+    const data = await hasuraClient.request<{
+      refunds_aggregate?: { aggregate?: { count?: number } };
+    }>(query, { refundId });
+    return (data.refunds_aggregate?.aggregate?.count ?? 0) > 0;
+  }
+
+  /**
+   * Updates a refund record (status, txHash, failureReason).  Used after the
+   * on-chain executor resolves or fails.
+   */
+  static async upsertRefund(row: RefundRow): Promise<void> {
+    const mutation = `
+      mutation UpsertRefund(
+        $refundId: String!
+        $escrowId: String!
+        $claimedAt: timestamptz!
+        $amount: String
+        $currency: String
+        $claimedBy: String
+        $status: String!
+        $refundTo: String
+        $escrowType: String
+        $milestoneIndex: String
+        $txHash: String
+        $failureReason: String
+      ) {
+        insert_refunds_one(
+          object: {
+            refund_id: $refundId
+            escrow_id: $escrowId
+            claimed_at: $claimedAt
+            amount: $amount
+            currency: $currency
+            claimed_by: $claimedBy
+            status: $status
+            refund_to: $refundTo
+            escrow_type: $escrowType
+            milestone_index: $milestoneIndex
+            tx_hash: $txHash
+            failure_reason: $failureReason
+          }
+          on_conflict: {
+            constraint: refunds_pkey
+            update_columns: [status, tx_hash, failure_reason, claimed_by, refund_to,
+                             escrow_type, milestone_index, amount, currency]
+          }
+        ) {
+          refund_id
+        }
+      }
+    `;
+    await hasuraClient.request(mutation, {
+      refundId: row.refund_id,
+      escrowId: row.escrow_id,
+      claimedAt: row.claimed_at,
+      amount: row.amount ?? null,
+      currency: row.currency ?? null,
+      claimedBy: row.claimed_by ?? null,
+      status: row.status,
+      refundTo: row.refund_to ?? null,
+      escrowType: row.escrow_type ?? null,
+      milestoneIndex: row.milestone_index ?? null,
+      txHash: row.tx_hash ?? null,
+      failureReason: row.failure_reason ?? null,
+    });
+  }
+
+  /**
+   * Deletes refund rows whose `claimed_at` is before `cutoff`.
+   * Returns the number of rows deleted.
+   */
+  static async deleteRefundsBefore(cutoff: string): Promise<number> {
+    const mutation = `
+      mutation DeleteRefundsBefore($cutoff: timestamptz!) {
+        delete_refunds(where: { claimed_at: { _lt: $cutoff } }) {
+          affected_rows
+        }
+      }
+    `;
+    const data = await hasuraClient.request<{ delete_refunds?: { affected_rows?: number } }>(
+      mutation,
+      { cutoff }
+    );
+    return data.delete_refunds?.affected_rows ?? 0;
+  }
+}
+
+/** Row shape for the `refunds` Postgres table (#512). */
+export interface RefundRow {
+  refund_id: string;
+  escrow_id: string;
+  claimed_at: string;
+  amount: string | null;
+  currency: string | null;
+  claimed_by: string | null;
+  status: string;
+  refund_to: string | null;
+  escrow_type: string | null;
+  milestone_index: string | null;
+  tx_hash: string | null;
+  failure_reason: string | null;
+  retry_count?: number;
 }

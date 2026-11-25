@@ -48,6 +48,7 @@ import { getCorrelationId as getRequestId } from "../middleware/requestLogger";
 import { logger } from "../lib/logger";
 import { captureException } from "../lib/sentry";
 import { HasuraService } from "./hasura.service";
+import type { RefundRow } from "./hasura.service";
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -229,6 +230,72 @@ export class InMemoryRefundStore implements RefundStore {
   /** Visible for testing — returns the raw map size. */
   get size(): number {
     return this.store.size;
+  }
+}
+
+// ── Postgres-backed store (#512) ─────────────────────────────────────────────
+/**
+ * Postgres-backed refund idempotency store. Every read and write goes through
+ * `HasuraService`, so refund records survive a restart and are shared across
+ * every backend instance. The PRIMARY KEY constraint on `refund_id` in the
+ * `refunds` table is the authoritative cross-instance duplicate guard: two
+ * concurrent `insertIfAbsent` calls for the same refundId are serialized by
+ * the database — only one returns `affected_rows = 1`.
+ */
+export class PostgresRefundStore implements RefundStore {
+  private rowToRecord(row: RefundRow): ClaimedRefund {
+    return {
+      refundId: row.refund_id,
+      escrowId: row.escrow_id,
+      claimedAt: row.claimed_at,
+      amount: row.amount ?? undefined,
+      currency: row.currency ?? undefined,
+      claimedBy: row.claimed_by ?? undefined,
+      status: (row.status as ClaimedRefund["status"]) ?? "claimed",
+      refundTo: row.refund_to ?? undefined,
+      escrowType: row.escrow_type as ClaimedRefund["escrowType"] ?? undefined,
+      milestoneIndex: row.milestone_index ?? undefined,
+      txHash: row.tx_hash ?? undefined,
+      failureReason: row.failure_reason ?? undefined,
+    };
+  }
+
+  private recordToRow(record: ClaimedRefund): RefundRow {
+    return {
+      refund_id: record.refundId,
+      escrow_id: record.escrowId,
+      claimed_at: record.claimedAt,
+      amount: record.amount !== undefined ? String(record.amount) : null,
+      currency: record.currency ?? null,
+      claimed_by: record.claimedBy ?? null,
+      status: record.status ?? "claimed",
+      refund_to: record.refundTo ?? null,
+      escrow_type: record.escrowType ?? null,
+      milestone_index: record.milestoneIndex ?? null,
+      tx_hash: record.txHash ?? null,
+      failure_reason: record.failureReason ?? null,
+    };
+  }
+
+  async has(refundId: string): Promise<boolean> {
+    return HasuraService.hasRefund(refundId);
+  }
+
+  async get(refundId: string): Promise<ClaimedRefund | undefined> {
+    const row = await HasuraService.getRefund(refundId);
+    return row ? this.rowToRecord(row) : undefined;
+  }
+
+  async set(refundId: string, record: ClaimedRefund): Promise<void> {
+    await HasuraService.upsertRefund(this.recordToRow({ ...record, refundId }));
+  }
+
+  async insertIfAbsent(refundId: string, record: ClaimedRefund): Promise<boolean> {
+    return HasuraService.insertRefundIfAbsent(this.recordToRow({ ...record, refundId }));
+  }
+
+  async cleanupBefore(cutoff: Date): Promise<number> {
+    return HasuraService.deleteRefundsBefore(cutoff.toISOString());
   }
 }
 
@@ -425,8 +492,12 @@ export class RefundService {
 }
 
 // Singleton — routes import this shared instance.  Claims execute on-chain.
+// PostgresRefundStore replaces InMemoryRefundStore so the idempotency record
+// is durable: a restart or a second backend instance cannot double-pay a refund
+// (#512). The PRIMARY KEY constraint on `refund_id` in the `refunds` table
+// is the authoritative cross-instance duplicate guard.
 export const refundService = new RefundService(
-  new InMemoryRefundStore(),
+  new PostgresRefundStore(),
   new TrustlessWorkRefundExecutor(),
   (escrowId) => HasuraService.getEscrowAmountByContractId(escrowId),
 );
